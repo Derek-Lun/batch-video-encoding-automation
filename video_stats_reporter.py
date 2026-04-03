@@ -154,7 +154,7 @@ def write_to_csv(csv_file, data):
 # ----------------------------
 
 if __name__ == "__main__":
-    original_directory = r"path/to/video"
+    video_directory = r"path/to/video"
 
     video_extensions = ["3gp", "avi", "divx", "mp4", "mkv", "mov", "wmv", "mpeg", "mts"]
 
