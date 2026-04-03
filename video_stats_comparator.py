@@ -1,93 +1,185 @@
 import os
 import csv
-from moviepy.editor import VideoFileClip
 import subprocess
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ----------------------------
+# Helpers
+# ----------------------------
 
 def change_percentage(original, new):
+    if original in (0, None):
+        return 0
     return ((new - original) / original) * 100
 
-def calculate_vmaf(original_file, mkv_file):
+
+def ffprobe_video_info(file_path):
     try:
-        vmaf_command = [
-            'ffmpeg',
-            '-i', original_file,
-            '-i', mkv_file,
-            '-filter_complex', '[0:v][1:v]libvmaf=log_fmt=json:log_path=vmaf.json',
-            '-f', 'null', '-'
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries",
+            "stream=codec_name,width,height,nb_frames,r_frame_rate,duration",
+            "-show_entries",
+            "format=duration",
+            "-of", "json",
+            file_path
         ]
-        
-        subprocess.run(vmaf_command, check=True, capture_output=True)
-        
-        with open('vmaf.json', 'r') as vmaf_file:
-            vmaf_data = vmaf_file.read()
-        
-        vm = json.loads(vmaf_data)
-        os.remove('vmaf.json')
-        
-        return vm["pooled_metrics"]["vmaf"]["min"], vm["pooled_metrics"]["vmaf"]["max"], vm["pooled_metrics"]["vmaf"]["mean"], vm["pooled_metrics"]["vmaf"]["harmonic_mean"]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+
+        streams = data.get("streams", [])
+        if not streams:
+            return {}
+
+        stream = streams[0]
+
+        # Duration
+        duration = stream.get("duration")
+        if duration is None:
+            duration = data.get("format", {}).get("duration")
+
+        duration = float(duration) if duration else None
+
+        # FPS
+        fps = None
+        r_frame_rate = stream.get("r_frame_rate")
+        if r_frame_rate and r_frame_rate != "0/0":
+            num, den = map(int, r_frame_rate.split("/"))
+            fps = num / den if den != 0 else None
+
+        # Frame count
+        nb_frames = stream.get("nb_frames")
+        if nb_frames:
+            nb_frames = int(nb_frames)
+        elif fps and duration:
+            nb_frames = round(fps * duration)
+        else:
+            nb_frames = None
+
+        return {
+            "codec": stream.get("codec_name", "unknown"),
+            "width": stream.get("width"),
+            "height": stream.get("height"),
+            "resolution": (stream.get("width"), stream.get("height")),
+            "duration": duration,
+            "frames": nb_frames,
+            "fps": fps
+        }
+
     except Exception as e:
-        print(f"Error calculating VMAF score for {original_file} and {mkv_file}: {e}")
-        return ("-", "-", "-", "-")
+        print(f"ffprobe failed for {file_path}: {e}")
+        return {}
 
-def compare_video_info(original_dir, mkv_dir, extensions):
-    video_comparison = []
-    
-    for dirpath, _, filenames in os.walk(original_dir):
-        for filename in filenames:
-            name, ext = os.path.splitext(filename)
-            if ext[1:].lower() in extensions:
-                original_file = os.path.join(dirpath, filename)
-                mkv_file = os.path.join(mkv_dir, os.path.relpath(original_file, original_dir))
-                mkv_file = os.path.splitext(mkv_file)[0] + ".mkv"
-                
-                if os.path.exists(mkv_file):
-                    original_clip = VideoFileClip(original_file)
-                    mkv_clip = VideoFileClip(mkv_file)
-                    vmaf_min, vmaf_max, vmaf_mean, vmaf_harmonic_mean = calculate_vmaf(original_file, mkv_file)
-                    
-                    original_size = os.path.getsize(original_file)
-                    mkv_size = os.path.getsize(mkv_file)
-                    size_change_percentage = change_percentage(original_size, mkv_size)
 
-                    original_duration = original_clip.duration
-                    mkv_duration = mkv_clip.duration
-                    duration_change_percentage = change_percentage(original_duration, mkv_duration)
+# ----------------------------
+# Core processing
+# ----------------------------
 
-                    original_frames = original_clip.reader.nframes
-                    mkv_frames = mkv_clip.reader.nframes
-                    frame_change_percentage = change_percentage(original_frames, mkv_frames)
-                    
-                    video_comparison.append((original_file, mkv_file, original_size, mkv_size, size_change_percentage, vmaf_min, vmaf_max, vmaf_mean, vmaf_harmonic_mean, original_duration, mkv_duration, duration_change_percentage, original_frames, mkv_frames, frame_change_percentage))
-                    print(f"{original_file, mkv_file, original_size, mkv_size, size_change_percentage, vmaf_min, vmaf_max, vmaf_mean, vmaf_harmonic_mean, original_duration, mkv_duration, duration_change_percentage, original_frames, mkv_frames, frame_change_percentage}")
-                    
-                    original_clip.close()
-                    mkv_clip.close()
-                else:
-                    print(f"MKV file not found for: {original_file}")
-                    video_comparison.append((original_file, "MKV Missing", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-"))
-    
-    return video_comparison
+def process_file(original_file, mkv_file):
+    try:
+        if not os.path.exists(mkv_file):
+            return (original_file, "MKV Missing", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-")
+
+        original_info = ffprobe_video_info(original_file)
+        mkv_info = ffprobe_video_info(mkv_file)
+
+        original_size = os.path.getsize(original_file)
+        mkv_size = os.path.getsize(mkv_file)
+        size_change_percentage = change_percentage(original_size, mkv_size)
+
+        original_duration = original_info.get("duration")
+        mkv_duration = mkv_info.get("duration")
+        duration_change_percentage = change_percentage(original_duration, mkv_duration)
+
+        original_frames = original_info.get("frames")
+        mkv_frames = mkv_info.get("frames")
+        frame_change_percentage = change_percentage(original_frames, mkv_frames)
+
+        original_resolution = original_info.get("resolution")
+        mkv_resolution = mkv_info.get("resolution")
+
+        original_codec = original_info.get("codec", "unknown")
+        mkv_codec = mkv_info.get("codec", "unknown")
+
+        return (
+            original_file, mkv_file,
+            original_size, mkv_size, size_change_percentage,
+            "-", "-", "-", "-",  # VMAF placeholders
+            original_duration, mkv_duration, duration_change_percentage,
+            original_frames, mkv_frames, frame_change_percentage,
+            original_resolution, mkv_resolution,
+            original_codec, mkv_codec
+        )
+
+    except Exception as e:
+        print(f"Error processing {original_file}: {e}")
+        return (original_file, "ERROR", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-")
+
+
+# ----------------------------
+# Main comparison
+# ----------------------------
+
+def compare_video_info(original_dir, mkv_dir, extensions, max_workers=8):
+    tasks = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for dirpath, _, filenames in os.walk(original_dir):
+            for filename in filenames:
+                ext = os.path.splitext(filename)[1][1:].lower()
+                if ext in extensions:
+                    original_file = os.path.join(dirpath, filename)
+
+                    mkv_file = os.path.join(mkv_dir,os.path.relpath(original_file, original_dir))
+                    mkv_file = os.path.splitext(mkv_file)[0] + ".mkv"
+
+                    tasks.append(executor.submit(process_file, original_file, mkv_file))
+
+        results = []
+        for future in as_completed(tasks):
+            result = future.result()
+            print(result)
+            results.append(result)
+
+    return results
+
+
+# ----------------------------
+# CSV writer
+# ----------------------------
 
 def write_to_csv(csv_file, data):
-    with open(csv_file, mode='w', newline='') as file:
+    with open(csv_file, mode='w', newline='', encoding='utf-8-sig') as file:
         writer = csv.writer(file)
-        writer.writerow(["Original File", "MKV File", "Original Size (bytes)", "MKV Size (bytes)", "Size Change Percentage", "Minimum VMAF Score", "Maximum VMAF Score", "Mean VMAF Score", "Harmonic Mean VMAF Score", "Original Duration (s)", "MKV Duration (s)", "Duration Change Percentage", "Original Frames", "MKV Frames", "Frame Change Percentage"])
-        for item in data:
-            writer.writerow(item)
+        writer.writerow([
+            "Original File", "MKV File",
+            "Original Size (bytes)", "MKV Size (bytes)", "Size Change %",
+            "Min VMAF", "Max VMAF", "Mean VMAF", "Harmonic Mean VMAF",
+            "Original Duration (s)", "MKV Duration (s)", "Duration Change %",
+            "Original Frames", "MKV Frames", "Frame Change %",
+            "Original Resolution", "MKV Resolution",
+            "Original Codec", "MKV Codec"
+        ])
+        writer.writerows(data)
+
+
+# ----------------------------
+# Entry point
+# ----------------------------
 
 if __name__ == "__main__":
-    # Specify the directory paths for the original video files and MKV files
     original_directory = r"path/to/original"
     mkv_directory = r"path/to/mkv"
 
-    # Specify the video file extensions to look for
-    video_extensions = ["mp4", "avi", "mpeg", "3gp", "mov", "wmv"]
+    video_extensions = ["3gp", "avi", "divx", "mp4", "mov", "wmv", "mpeg", "mts"]
 
-    video_comparison_data = compare_video_info(original_directory, mkv_directory, video_extensions)
+    data = compare_video_info(original_directory, mkv_directory, video_extensions, max_workers=8)
 
-    # Write the comparison data to a CSV file
-    csv_file_path = "video_stats_comparison.csv"
-    write_to_csv(csv_file_path, video_comparison_data)
+    output_file = "video_stats_comparison.csv"
+    write_to_csv(output_file, data)
 
-    print(f"Video info comparison data written to: {csv_file_path}")
+    print(f"\nDone! Results saved to: {output_file}")
