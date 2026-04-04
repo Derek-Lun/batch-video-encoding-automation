@@ -1,75 +1,136 @@
 import os
-import fnmatch
 import shutil
+import subprocess
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-def find_movie_files(root_dir, extensions):
+# ----------------------------
+# Config
+# ----------------------------
+
+ROOT_DIRECTORY = Path(r"path/to/root")
+OUTPUT_DIRECTORY = Path(r"path/to/output")
+PROCESSED_DIRECTORY = Path(r"path/to/processed")
+TEMP_DIRECTORY = Path(r"path/to/temp")
+
+VIDEO_EXTENSIONS = {"3gp", "avi", "divx", "mp4", "mov", "wmv", "mpeg", "mts"}
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+def get_optimal_workers():
+    cpu_count = os.cpu_count() or 4
+    return max(1, cpu_count // 2)  # ffmpeg is CPU heavy
+
+
+def map_path(input_file: Path, src_root: Path, dst_root: Path, new_ext=None):
+    rel = input_file.relative_to(src_root)
+    if new_ext:
+        rel = rel.with_suffix(new_ext)
+    return dst_root / rel
+
+
+def ensure_parent_dir(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+# ----------------------------
+# File discovery
+# ----------------------------
+
+def find_movie_files(root_dir):
     movie_files = []
-    for dirpath, dirnames, filenames in os.walk(root_dir):
-        for filename in filenames:
-            if any(fnmatch.fnmatch(filename, f"*.{ext}") for ext in extensions):
-                movie_files.append(os.path.join(dirpath, filename))
+    for path in root_dir.rglob("*"):
+        if path.is_file() and path.suffix.lower()[1:] in VIDEO_EXTENSIONS:
+            movie_files.append(path)
     return movie_files
 
-def get_new_filepath(input_file, new_directory):
-    return input_file.replace(original_directory, new_directory)
 
-def convert_extension_to_mkv(input_file):
-    return input_file[:-4] + ".mkv"
+# ----------------------------
+# FFmpeg conversion
+# ----------------------------
 
-def convert_to_AV1(input_file, output_file):
-    # command for windows. Require HandBrakeCLI.exe to exist in the same directory.
-    command = "HandBrakeCLI.exe -v --preset-import-file \"backup quality.json\" --preset \"backup quality\"" + " -i \""+ input_file + "\" -o \"" + output_file + "\""
-    # command for linux. Require HandBrakeCLI to be installed.
-    # command = "flatpak run --command=HandBrakeCLI fr.handbrake.ghb -v --preset-import-file backup_quality.json --preset \"backup quality\"" + " -i \""+ input_file + "\" -o \"" + output_file + "\""
-    print("command: " + command)
-    print(os.system(command))
+def convert_to_h265(input_file: Path, output_file: Path):
+    cmd = [
+        "ffmpeg",
+        "-y",  # overwrite temp file if exists
+        "-i", str(input_file),
+        "-c:v", "libx265",
+        "-preset", "veryslow",
+        "-crf", "20",
+        "-c:a", "copy",  # keep original audio
+        str(output_file)
+    ]
 
-def make_dir(directory):
+    print(f"🎬 Converting: {input_file}")
+
+    result = subprocess.run(cmd)
+
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg failed for {input_file}")
+
+
+# ----------------------------
+# Processing logic
+# ----------------------------
+
+def process_file(movie_file: Path):
     try:
-        os.makedirs(os.path.dirname(directory))
-    except:
-        print(os.path.dirname(directory) + " already created")
+        output_file = map_path(movie_file, ROOT_DIRECTORY, OUTPUT_DIRECTORY, ".mkv")
+        temp_file = map_path(movie_file, ROOT_DIRECTORY, TEMP_DIRECTORY, ".mkv")
+        processed_file = map_path(movie_file, ROOT_DIRECTORY, PROCESSED_DIRECTORY)
+
+        # Skip if already done
+        if output_file.exists():
+            print(f"⏭️ Skipping (exists): {output_file}")
+            return
+
+        # Ensure directories exist
+        ensure_parent_dir(output_file)
+        ensure_parent_dir(temp_file)
+        ensure_parent_dir(processed_file)
+
+        # Convert
+        convert_to_h265(movie_file, temp_file)
+
+        # Move temp → final
+        shutil.move(str(temp_file), str(output_file))
+
+        # Optionally move original → processed
+        # shutil.move(str(movie_file), str(processed_file))
+
+        print(f"✅ Done: {movie_file}")
+
+    except Exception as e:
+        print(f"❌ Failed: {movie_file} -> {e}")
+
+
+# ----------------------------
+# Main
+# ----------------------------
+
+def main():
+    movie_files = find_movie_files(ROOT_DIRECTORY)
+
+    if not movie_files:
+        print("No movie files found.")
+        return
+
+    print(f"Found {len(movie_files)} video files.")
+
+    max_workers = get_optimal_workers()
+    print(f"Using {max_workers} workers...")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(process_file, f) for f in movie_files]
+
+        for future in as_completed(futures):
+            future.result()  # propagate exceptions if any
+
+    print("\n🎉 All done!")
+
 
 if __name__ == "__main__":
-    original_directory = os.path.expanduser("e:/temp")
-    processing_directory = original_directory + " processing"
-    temp_directory = original_directory + " temp"
-    processed_directory = original_directory + " processed"
-    converted_directory = original_directory + " converted"
-
-    # Specify the movie file extensions to look for
-    movie_extensions = ["mp4", "avi", "mpeg", "3gp", "mov", "wmv"]
-
-    movie_files = find_movie_files(original_directory, movie_extensions)
-
-    # Display the list of movie files found
-    if movie_files:
-        print("Movie files found:" + str(len(movie_files)))
-        for movie_file in movie_files:
-            print("orignal video: " + movie_file)
-
-            processing_file = get_new_filepath(movie_file, processing_directory)
-            print("processing location: " + processing_file)
-            make_dir(processing_file)
-
-            temp_file = convert_extension_to_mkv(get_new_filepath(movie_file, temp_directory))
-            print("temp location: " + temp_file)
-            make_dir(temp_file)
-
-            processed_file = get_new_filepath(movie_file, processed_directory)
-            print("processed location: " + processed_file)
-            make_dir(processed_file)
-
-            converted_file = convert_extension_to_mkv(get_new_filepath(movie_file, converted_directory))
-            print("output location: " + converted_file)
-            make_dir(converted_file)
-
-            shutil.move(movie_file, processing_file)
-            convert_to_AV1(processing_file, temp_file)
-            print(movie_file + "convert completed")
-
-            shutil.move(processing_file, processed_file)
-            shutil.move(temp_file, converted_file)
-    else:
-        print("No movie files found.")
+    main()
