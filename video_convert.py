@@ -1,6 +1,8 @@
 import os
 import shutil
 import subprocess
+import random
+import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -55,12 +57,12 @@ def find_movie_files(root_dir):
 def convert_to_h265(input_file: Path, output_file: Path):
     cmd = [
         "ffmpeg",
-        "-y",  # overwrite temp file if exists
+        "-y",
         "-i", str(input_file),
         "-c:v", "libx265",
         "-preset", "veryslow",
         "-crf", "20",
-        "-c:a", "copy",  # keep original audio
+        "-c:a", "copy",
         str(output_file)
     ]
 
@@ -87,21 +89,34 @@ def process_file(movie_file: Path):
             print(f"⏭️ Skipping (exists): {output_file}")
             return
 
+        # ----------------------------
+        # 🔥 CLAIM FILE (move before processing)
+        # ----------------------------
+        try:
+            ensure_parent_dir(processed_file)
+            shutil.move(str(movie_file), str(processed_file))
+        except FileNotFoundError:
+            # Another host already took it
+            print(f"🔒 Skipped (taken by another host): {movie_file}")
+            return
+        except Exception as e:
+            print(f"⚠️ Failed to claim file: {movie_file} -> {e}")
+            return
+
+        # Now we own this file
+        claimed_file = processed_file
+
         # Ensure directories exist
         ensure_parent_dir(output_file)
         ensure_parent_dir(temp_file)
-        ensure_parent_dir(processed_file)
 
         # Convert
-        convert_to_h265(movie_file, temp_file)
+        convert_to_h265(claimed_file, temp_file)
 
         # Move temp → final
         shutil.move(str(temp_file), str(output_file))
 
-        # Optionally move original → processed
-        # shutil.move(str(movie_file), str(processed_file))
-
-        print(f"✅ Done: {movie_file}")
+        print(f"✅ Done: {claimed_file}")
 
     except Exception as e:
         print(f"❌ Failed: {movie_file} -> {e}")
@@ -120,6 +135,12 @@ def main():
 
     print(f"Found {len(movie_files)} video files.")
 
+    # ----------------------------
+    # 🔥 RANDOMIZE ORDER
+    # ----------------------------
+    random.seed(time.time())
+    random.shuffle(movie_files)
+
     max_workers = get_optimal_workers()
     print(f"Using {max_workers} workers...")
 
@@ -127,7 +148,7 @@ def main():
         futures = [executor.submit(process_file, f) for f in movie_files]
 
         for future in as_completed(futures):
-            future.result()  # propagate exceptions if any
+            future.result()
 
     print("\n🎉 All done!")
 
